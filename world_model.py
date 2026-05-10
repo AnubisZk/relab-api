@@ -47,11 +47,11 @@ TARGET_NAMES = [
 
 class WorldModel:
     def __init__(self):
-        self.model   = None
-        self.scaler  = None
-        self.trained = False
-        self.metrics = {}
-        # Try loading saved model
+        self.model         = None
+        self.scaler        = None
+        self.target_scaler = None
+        self.trained       = False
+        self.metrics       = {}
         self._try_load()
 
     def _try_load(self):
@@ -59,6 +59,8 @@ class WorldModel:
             try:
                 self.model   = joblib.load(MODEL_PATH)
                 self.scaler  = joblib.load(SCALER_PATH)
+                ts_path = Path("world_model_target_scaler.joblib")
+                self.target_scaler = joblib.load(ts_path) if ts_path.exists() else None
                 self.trained = True
                 print("[WorldModel] Loaded saved model")
             except Exception as e:
@@ -173,16 +175,25 @@ class WorldModel:
     def train(self, n_samples: int = 5000) -> dict:
         """
         Train MLPRegressor on physics engine simulation data.
+        Uses log1p transform on targets to handle large value ranges.
         Architecture: 3 hidden layers [128, 64, 32] with relu activation.
         """
         print(f"[WorldModel] Generating {n_samples} training samples...")
         X, y = self.generate_training_data(n_samples)
 
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.15, random_state=42)
+        # Log1p transform targets to normalize large ranges
+        # (E values can range 0–100,000+ kWh)
+        y_log = np.sign(y) * np.log1p(np.abs(y))
+
+        X_train, X_val, y_train, y_val = train_test_split(X, y_log, test_size=0.15, random_state=42)
 
         self.scaler = StandardScaler()
         X_train_s   = self.scaler.fit_transform(X_train)
         X_val_s     = self.scaler.transform(X_val)
+
+        # Also scale targets
+        self.target_scaler = StandardScaler()
+        y_train_s = self.target_scaler.fit_transform(y_train)
 
         print("[WorldModel] Training MLPRegressor...")
         self.model = MLPRegressor(
@@ -190,60 +201,75 @@ class WorldModel:
             activation='relu',
             solver='adam',
             learning_rate_init=0.001,
-            max_iter=300,
+            max_iter=500,
             early_stopping=True,
             validation_fraction=0.1,
-            n_iter_no_change=15,
+            n_iter_no_change=20,
             random_state=42,
             verbose=False,
         )
-        self.model.fit(X_train_s, y_train)
+        self.model.fit(X_train_s, y_train_s)
 
-        # Validation metrics
-        y_pred = self.model.predict(X_val_s)
+        # Validation — inverse transform back to original scale
+        y_pred_s   = self.model.predict(X_val_s)
+        y_pred_log = self.target_scaler.inverse_transform(y_pred_s)
+        y_pred     = np.sign(y_pred_log) * (np.expm1(np.abs(y_pred_log)))
+        y_val_orig = np.sign(y_val) * (np.expm1(np.abs(y_val)))
+
         mape_per_target = []
         for i, name in enumerate(TARGET_NAMES):
             try:
-                mape = mean_absolute_percentage_error(y_val[:,i], y_pred[:,i]) * 100
+                mask = np.abs(y_val_orig[:, i]) > 1.0  # skip near-zero
+                if mask.sum() < 10:
+                    mape_per_target.append(0.0)
+                    continue
+                mape = mean_absolute_percentage_error(
+                    y_val_orig[mask, i], y_pred[mask, i]) * 100
+                mape = min(mape, 100.0)  # cap at 100%
             except Exception:
                 mape = 0.0
             mape_per_target.append(round(mape, 2))
 
-        mean_mape = np.mean(mape_per_target)
+        mean_mape  = np.mean(mape_per_target)
         confidence = max(0.0, min(100.0, 100 - mean_mape))
 
         self.metrics = {
-            'n_samples':   len(X),
-            'n_train':     len(X_train),
-            'n_val':       len(X_val),
-            'mean_mape':   round(mean_mape, 2),
-            'confidence':  round(confidence, 1),
-            'per_target':  dict(zip(TARGET_NAMES, mape_per_target)),
+            'n_samples':  len(X),
+            'n_train':    len(X_train),
+            'n_val':      len(X_val),
+            'mean_mape':  round(float(mean_mape), 2),
+            'confidence': round(float(confidence), 1),
+            'per_target': dict(zip(TARGET_NAMES, mape_per_target)),
         }
         self.trained = True
 
-        # Save
-        joblib.dump(self.model,  MODEL_PATH)
-        joblib.dump(self.scaler, SCALER_PATH)
-        print(f"[WorldModel] Training complete. Confidence: {confidence:.1f}%")
-
+        joblib.dump(self.model,         MODEL_PATH)
+        joblib.dump(self.scaler,        SCALER_PATH)
+        joblib.dump(self.target_scaler, Path("world_model_target_scaler.joblib"))
+        print(f"[WorldModel] Done. Confidence: {confidence:.1f}%")
         return self.metrics
 
     # ── PREDICTION ─────────────────────────────────────────────
 
     def predict(self, inputs: dict) -> dict:
         """
-        Fast surrogate prediction from input features.
-        Returns predicted outputs + confidence.
+        Fast surrogate prediction. Inverse transforms log-scaled targets.
         """
         if not self.trained:
-            raise RuntimeError("World model not trained. Call /api/world-model/train first.")
+            raise RuntimeError("World model not trained.")
 
-        X = self.extract_features(inputs)
+        X   = self.extract_features(inputs)
         X_s = self.scaler.transform(X)
-        y_pred = self.model.predict(X_s)[0]
+        y_pred_s = self.model.predict(X_s)
 
-        return {name: float(val) for name, val in zip(TARGET_NAMES, y_pred)}
+        # Inverse target scaling + inverse log1p
+        if self.target_scaler is not None:
+            y_pred_log = self.target_scaler.inverse_transform(y_pred_s)
+        else:
+            y_pred_log = y_pred_s
+        y_pred = np.sign(y_pred_log) * (np.expm1(np.abs(y_pred_log)))
+
+        return {name: float(val) for name, val in zip(TARGET_NAMES, y_pred[0])}
 
     # ── SURPRISE SCORE ─────────────────────────────────────────
 
