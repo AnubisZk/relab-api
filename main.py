@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import time
+from contextlib import asynccontextmanager
 
 from physics_engine import (
     SolarParams, WindParams, OffshoreParams, BatteryParams, CostParams,
@@ -28,19 +29,31 @@ from physics_engine import (
 from optimizer_scipy import run_slsqp, run_differential_evolution
 from world_model import world_model
 
-# ── APP ─────────────────────────────────────────────────────
+# ── AUTO TRAIN ON STARTUP ────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Train world model on startup if not already trained
+    if not world_model.trained:
+        import threading
+        def auto_train():
+            print("[Startup] World model not found — auto-training with 10,000 samples...")
+            world_model.train(n_samples=10000)
+        threading.Thread(target=auto_train, daemon=True).start()
+    yield
 
+# ── APP ─────────────────────────────────────────────────────
 app = FastAPI(
     title="RE Optimization Lab API",
     description="Renewable Energy Physics Engine + World Model + Optimizer · ZSK Solutions",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production: ["https://renewable-opt-lab.netlify.app"]
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
