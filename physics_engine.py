@@ -119,8 +119,9 @@ def calc_solar(p: SolarParams) -> dict:
         loss_temp=max(0.0, loss_temp), loss_dust=max(0.0, loss_dust),
         loss_shade=max(0.0, loss_shade), loss_angle=max(0.0, loss_angle),
         PR=PR, SY=SY, P_peak=P_peak,
-        clean_worth=clean_worth, cleaning_cost_applied=cleaning_cost_applied,
-        energy_recovered_val=energy_recovered_val,
+        clean_worth=bool(clean_worth),
+        cleaning_cost_applied=float(cleaning_cost_applied),
+        energy_recovered_val=float(energy_recovered_val),
         formula=f"E={p.panelArea}×{p.irradiance/1000:.3f}×{p.efficiency}×{p.timeHours}"
                 f"×cos({abs(p.tilt-30):.1f}°)×{C_f_eff:.3f}×(1-{p.shadeLoss})×(1-{L_temp:.4f})"
     )
@@ -178,7 +179,7 @@ def calc_wind(p: WindParams, time_hours: float) -> dict:
         loss_wake=max(0.0, loss_wake),
         loss_turbulence=max(0.0, loss_turbulence),
         loss_yaw=max(0.0, loss_yaw),
-        spacingOk=p.turbineSpacing >= 7, rotorD=rotorD,
+        spacingOk=bool(p.turbineSpacing >= 7), rotorD=rotorD,
         formula=f"P=½×{p.airDensity}×π×{p.rotorRadius}²×{p.windSpeed}³×{p.powerCoeff}"
                 f"={P_single:.2f}kW×cos³({p.yawAngle}°)×(1-{L_wake_eff:.3f})×{p.turbineCount}T"
     )
@@ -207,8 +208,8 @@ def calc_offshore(p: OffshoreParams, E_wind_kWh: float) -> dict:
         R_sea=R_sea, E_net=E_net, maint_kWh=maint_daily_kWh,
         loss_wave=max(0.0, loss_wave),
         loss_corrosion=max(0.0, loss_corrosion),
-        risk_violation=R_sea > p.safetyThreshold,
-        maintenance_accessible=p.waveHeight < 3.5,
+        risk_violation=bool(R_sea > p.safetyThreshold),
+        maintenance_accessible=bool(p.waveHeight < 3.5),
         formula=f"R={w1}×{p.waveHeight}+{w2}×{p.wavePeriod}+{w3}×{p.currentSpeed}"
                 f"+{w4}×{p.platformMotion}={R_sea:.3f}"
     )
@@ -233,7 +234,7 @@ def calc_battery(p: BatteryParams, E_available: float) -> dict:
     return dict(
         B_next=B_next, B_available=B_avail, E_in=E_in, E_out=E_out,
         unmet=unmet, SOC=SOC,
-        reserve_violation=B_next < p.minimumReserve,
+        reserve_violation=bool(B_next < p.minimumReserve),
         formula=f"B_next={p.currentCharge}+{p.chargeEfficiency}×{E_in:.1f}"
                 f"-{E_out:.1f}/{p.dischargeEfficiency}={B_next:.2f} kWh"
     )
@@ -279,21 +280,21 @@ def calc_objective(s_res, w_res, o_res, b_res, solar_p, offshore_p, cost_p) -> d
 
 def check_constraints(solar_p, wind_p, o_res, b_res, w_res, cost_p) -> list:
     violations = []
-    if solar_p.panelArea > cost_p.availableArea:
+    if float(solar_p.panelArea) > float(cost_p.availableArea):
         violations.append({'id':'area','msg':f"Panel area {solar_p.panelArea}m² > available {cost_p.availableArea}m²",'severity':'error'})
-    if not w_res.get('spacingOk', True):
+    if not bool(w_res.get('spacingOk', True)):
         violations.append({'id':'spacing','msg':f"Spacing {wind_p.turbineSpacing}D < required 7D",'severity':'error'})
-    if b_res.get('reserve_violation'):
-        violations.append({'id':'reserve','msg':f"Battery final {b_res['B_next']:.1f} kWh < min reserve {solar_p.cleaningInterval}",'severity':'error'})
-    if o_res.get('risk_violation'):
+    if bool(b_res.get('reserve_violation')):
+        violations.append({'id':'reserve','msg':f"Battery final {b_res['B_next']:.1f} kWh < min reserve",'severity':'error'})
+    if bool(o_res.get('risk_violation')):
         violations.append({'id':'risk','msg':f"R_sea={o_res['R_sea']:.2f} > safety threshold",'severity':'error'})
-    if not (0 <= solar_p.tilt <= 90):
+    if not (0 <= float(solar_p.tilt) <= 90):
         violations.append({'id':'tilt','msg':f"Tilt {solar_p.tilt}° outside [0°, 90°]",'severity':'error'})
-    if not (0 <= wind_p.yawAngle <= 180):
+    if not (0 <= float(wind_p.yawAngle) <= 180):
         violations.append({'id':'yaw','msg':f"Yaw {wind_p.yawAngle}° outside [0°, 180°]",'severity':'error'})
-    if b_res.get('unmet', 0) > 0:
+    if float(b_res.get('unmet', 0)) > 0:
         violations.append({'id':'unmet','msg':f"Unmet demand: {b_res['unmet']:.1f} kWh/day",'severity':'warning'})
-    if not o_res.get('maintenance_accessible', True):
+    if not bool(o_res.get('maintenance_accessible', True)):
         violations.append({'id':'access','msg':f"Hs > 3.5m — maintenance access restricted",'severity':'warning'})
     return violations
 
